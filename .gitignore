@@ -1,0 +1,7 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+.DS_Store
+app/data/
+.env
+.app-secrets

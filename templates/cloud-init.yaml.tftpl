@@ -1,0 +1,139 @@
+#cloud-config
+package_update: true
+bootcmd:
+  - mkdir -p ${app_dir}
+packages:
+  - awscli
+  - curl
+  - docker.io
+  - jq
+  - python3
+  - unzip
+
+write_files:
+  - path: ${app_dir}/start.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      cd "${app_dir}"
+
+      if ! command -v docker >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y docker.io
+      fi
+
+      if ! docker compose version >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y docker-compose-plugin || apt-get install -y docker-compose-v2
+      fi
+
+      systemctl enable --now docker
+
+      if command -v nvidia-ctk >/dev/null 2>&1; then
+        nvidia-ctk runtime configure --runtime=docker || true
+        systemctl restart docker
+      fi
+
+      tmpdir="$(mktemp -d)"
+      trap 'rm -rf "$tmpdir"' EXIT
+      aws --region "${aws_region}" s3 cp "${bootstrap_s3_uri}" "$tmpdir/source.zip"
+      unzip -q "$tmpdir/source.zip" -d "$tmpdir/source"
+      src_dir="$tmpdir/source"
+
+      install -d -m 0755 \
+        "${app_dir}/data/hf-cache" \
+        "${app_dir}/data/coder" \
+        "${app_dir}/coder-template/build" \
+        "${app_dir}/aws/ssm-parameters"
+      chown -R 1000:1000 "${app_dir}/data/coder"
+      docker_gid="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || getent group docker | cut -d: -f3)"
+
+      cp "$src_dir/app/docker-compose.yml" "${app_dir}/docker-compose.yml"
+      cp "$src_dir/app/coder-template/main.tf" "${app_dir}/coder-template/main.tf"
+      cp "$src_dir/app/coder-template/build/Dockerfile" "${app_dir}/coder-template/build/Dockerfile"
+      cp "$src_dir/app/render-runtime-config.py" "${app_dir}/render-runtime-config.py"
+      cp "$src_dir/aws/ssm-parameters/coder-port-forward.json" "${app_dir}/aws/ssm-parameters/coder-port-forward.json"
+      cp "$src_dir/aws/ssm-parameters/vllm-port-forward.json" "${app_dir}/aws/ssm-parameters/vllm-port-forward.json"
+
+      touch .app-secrets
+      chmod 0600 .app-secrets
+
+      ensure_secret() {
+        local key="$1"
+        local bytes="$2"
+        if ! grep -q "^$${key}=" .app-secrets; then
+          printf '%s=%s\n' "$${key}" "$(openssl rand -hex "$${bytes}")" >> .app-secrets
+        fi
+      }
+
+      ensure_secret "CODER_POSTGRES_PASSWORD" 24
+
+      hf_secret="$(aws secretsmanager get-secret-value --region "${aws_region}" --secret-id "${hf_secret_id}" --query SecretString --output text 2>/dev/null || true)"
+      hf_token="$(python3 - "$hf_secret" <<'PY'
+      import json
+      import sys
+
+      raw = sys.argv[1] if len(sys.argv) > 1 else ""
+      token = raw.strip()
+      if token.startswith("{"):
+          try:
+              data = json.loads(token)
+              for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "token", "api_token"):
+                  if data.get(key):
+                      token = str(data[key]).strip()
+                      break
+          except Exception:
+              pass
+      print(token)
+      PY
+      )"
+
+      {
+        printf 'AWS_REGION=%s\n' "${aws_region}"
+        printf 'HF_SECRET_ID=%s\n' "${hf_secret_id}"
+        printf 'HUGGING_FACE_HUB_TOKEN=%s\n' "$hf_token"
+        printf 'VLLM_MODEL=%s\n' "${model_id}"
+        printf 'VLLM_MAX_MODEL_LEN=%s\n' "${max_model_len}"
+        printf "VLLM_SPECULATIVE_CONFIG='%s'\n" '{"method":"mtp","model":"${mtp_assistant_model}","num_speculative_tokens":${num_speculative_tokens}}'
+        printf 'VLLM_IMAGE=%s\n' "${vllm_image}"
+        printf 'CODER_IMAGE=%s\n' "${coder_image}"
+        printf 'DOCKER_GID=%s\n' "$docker_gid"
+        cat .app-secrets
+      } > .env
+      chmod 0600 .env
+
+      set -a
+      . ./.env
+      set +a
+
+      python3 ./render-runtime-config.py
+
+      docker compose pull
+      docker compose up -d
+  - path: /etc/systemd/system/private-code-agent.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=PrivateCodeAgent Docker Compose stack
+      Wants=network-online.target
+      After=network-online.target docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory=${app_dir}
+      ExecStart=${app_dir}/start.sh
+      ExecStop=/usr/bin/docker compose down
+      TimeoutStartSec=0
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable private-code-agent.service
+  - systemctl start private-code-agent.service
